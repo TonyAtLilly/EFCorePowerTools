@@ -1,0 +1,162 @@
+﻿using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using GOEddie.Dacpac.References;
+using Microsoft.SqlServer.Dac.Extensions.Prototype;
+using Microsoft.SqlServer.Dac.Model;
+using RevEng.Core.Abstractions;
+using RevEng.Core.Abstractions.Metadata;
+using RevEng.Core.Abstractions.Model;
+
+namespace ErikEJ.EntityFrameworkCore.Postgres.Scaffolding
+{
+    public class PostgresDacpacStoredProcedureModelFactory : IProcedureModelFactory
+    {
+        private readonly PostgresDacpacDatabaseModelFactoryOptions dacpacOptions;
+
+        public PostgresDacpacStoredProcedureModelFactory(PostgresDacpacDatabaseModelFactoryOptions options)
+        {
+            dacpacOptions = options;
+        }
+
+        public RoutineModel Create(string connectionString, ModuleModelFactoryOptions options)
+        {
+            if (string.IsNullOrEmpty(connectionString))
+            {
+                throw new ArgumentException(@"invalid path", nameof(connectionString));
+            }
+
+            if (!File.Exists(connectionString))
+            {
+                throw new ArgumentException($"Dacpac file not found: {connectionString}");
+            }
+
+            if (options is null)
+            {
+                throw new ArgumentNullException(nameof(options));
+            }
+
+            return GetStoredProcedures(connectionString, options, dacpacOptions.MergeDacpacs);
+        }
+
+        private static RoutineModel GetStoredProcedures(string dacpacPath, ModuleModelFactoryOptions options, bool mergeDacpacs)
+        {
+            var result = new List<RevEng.Core.Abstractions.Metadata.Procedure>();
+            var errors = new List<string>();
+
+            if (mergeDacpacs && dacpacPath != null)
+            {
+                var consolidator = new DacpacConsolidator();
+                dacpacPath = consolidator.Consolidate(dacpacPath);
+            }
+
+            using var model = new TSqlTypedModel(dacpacPath);
+
+            var procedures = model.GetObjects<TSqlProcedure>(DacQueryScopes.UserDefined)
+               .ToList();
+
+            var filter = new HashSet<string>(options.Modules);
+
+            foreach (var proc in procedures)
+            {
+                var procedure = new RevEng.Core.Abstractions.Metadata.Procedure
+                {
+                    Schema = proc.Name.Parts[0],
+                    Name = proc.Name.Parts[1],
+                };
+
+                var key = $"[{procedure.Schema}].[{procedure.Name}]";
+
+                if (filter.Count == 0 || filter.Contains(key))
+                {
+                    if (options.FullModel)
+                    {
+                        procedure.Parameters = GetStoredProcedureParameters(proc);
+
+                        if (options.MappedModules?.ContainsKey(key) ?? false)
+                        {
+                            procedure.MappedType = options.MappedModules[key];
+                        }
+
+#pragma warning disable CA1031 // Do not catch general exception types
+                        try
+                        {
+                            procedure.Results.Add(GetStoredProcedureResultElements(proc));
+                        }
+                        catch (Exception ex)
+                        {
+                            errors.Add($"Unable to get result set shape for {procedure.Schema}.{procedure.Name}" + Environment.NewLine + ex.ToString());
+                        }
+#pragma warning restore CA1031 // Do not catch general exception types
+                    }
+
+                    result.Add(procedure);
+                }
+            }
+
+            return new RoutineModel
+            {
+                Routines = result.Cast<Routine>().ToList(),
+                Errors = errors,
+            };
+        }
+
+        private static List<ModuleParameter> GetStoredProcedureParameters(TSqlProcedure proc)
+        {
+            var result = new List<ModuleParameter>();
+
+            foreach (var parameter in proc.Parameters)
+            {
+                var newParameter = new ModuleParameter()
+                {
+                    Length = parameter.Length,
+                    Name = parameter.Name.Parts[2].Trim('@'),
+                    Output = parameter.IsOutput,
+                    Precision = parameter.Precision,
+                    Scale = parameter.Scale,
+                    StoreType = parameter.DataType.First().Name.Parts[0],
+                    Nullable = true,
+                };
+
+                result.Add(newParameter);
+            }
+
+            // Add parameter to hold the standard return value
+            result.Add(new ModuleParameter()
+            {
+                Name = "returnValue",
+                StoreType = "int",
+                Output = true,
+                Nullable = false,
+            });
+
+            return result;
+        }
+
+        private static List<ModuleResultElement> GetStoredProcedureResultElements(TSqlProcedure proc)
+        {
+            var result = new List<ModuleResultElement>();
+            var metaProc = new SqlSharpener.Model.Procedure(proc.Element);
+
+            if (metaProc.Selects == null || !metaProc.Selects.Any())
+            {
+                return result;
+            }
+
+            int ordinal = 0;
+            foreach (var column in metaProc.Selects.FirstOrDefault()?.Columns)
+            {
+                result.Add(new ModuleResultElement
+                {
+                    Name = column.Name,
+                    Nullable = column.IsNullable,
+                    StoreType = column.DataTypes[SqlSharpener.TypeFormat.SqlServerDbType],
+                    Ordinal = ordinal++,
+                });
+            }
+
+            return result;
+        }
+    }
+}

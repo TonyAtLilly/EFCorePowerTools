@@ -1,0 +1,160 @@
+﻿using System;
+using System.Data;
+using System.Diagnostics.CodeAnalysis;
+using System.Linq;
+using Microsoft.EntityFrameworkCore.Design;
+using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Internal;
+using NetTopologySuite.Geometries;
+using RevEng.Common;
+using RevEng.Core.Abstractions;
+using RevEng.Core.Abstractions.Metadata;
+using RevEng.Core.Modules;
+
+namespace RevEng.Core.Functions
+{
+    public class PostgresFunctionScaffolder : PostgresRoutineScaffolder, IFunctionScaffolder
+    {
+        public PostgresFunctionScaffolder([NotNull] ICSharpHelper code)
+            : base(code)
+        {
+            FileNameSuffix = ".Functions";
+        }
+
+        protected override string WriteDbContextInterface(ModuleScaffolderOptions scaffolderOptions, RoutineModel model)
+        {
+            return null;
+        }
+
+        protected override string WriteDbContext(ModuleScaffolderOptions scaffolderOptions, RoutineModel model)
+        {
+            if (scaffolderOptions is null)
+            {
+                throw new ArgumentNullException(nameof(scaffolderOptions));
+            }
+
+            if (model is null)
+            {
+                throw new ArgumentNullException(nameof(model));
+            }
+
+            Sb = new IndentedStringBuilder();
+
+            Sb.AppendLine(PathHelper.Header);
+
+            Sb.AppendLine("using Microsoft.EntityFrameworkCore;");
+            Sb.AppendLine("using System;");
+            Sb.AppendLine("using System.Data;");
+            Sb.AppendLine("using System.Linq;");
+            Sb.AppendLine($"using {scaffolderOptions.ModelNamespace};");
+            if (model.Routines.SelectMany(r => r.Parameters).Any(p => p.ClrType() == typeof(Geometry)))
+            {
+                Sb.AppendLine("using NetTopologySuite.Geometries;");
+            }
+
+            Sb.AppendLine();
+            Sb.AppendLine($"namespace {scaffolderOptions.ContextNamespace}");
+            Sb.AppendLine("{");
+
+            using (Sb.Indent())
+            {
+                Sb.AppendLine($"public partial class {scaffolderOptions.ContextName}");
+
+                Sb.AppendLine("{");
+
+                using (Sb.Indent())
+                {
+                    foreach (var function in model.Routines)
+                    {
+                        GenerateFunctionStub(function, model);
+                    }
+
+                    GenerateModelCreation(model);
+                }
+
+                Sb.AppendLine("}");
+            }
+
+            Sb.AppendLine("}");
+
+            return Sb.ToString();
+        }
+
+        private void GenerateModelCreation(RoutineModel model)
+        {
+            Sb.AppendLine();
+            Sb.AppendLine("protected void OnModelCreatingGeneratedFunctions(ModelBuilder modelBuilder)");
+            Sb.AppendLine("{");
+
+            using (Sb.Indent())
+            {
+                foreach (var function in model.Routines.Cast<Function>().Where(f => !f.IsScalar))
+                {
+                    var typeName = GenerateIdentifierName(function, model) + "Result";
+
+                    Sb.AppendLine($"modelBuilder.Entity<{typeName}>().HasNoKey();");
+                }
+            }
+
+            Sb.AppendLine("}");
+        }
+
+        private void GenerateFunctionStub(Routine function, RoutineModel model)
+        {
+            var paramStrings = function.Parameters
+                .Select(p => $"{Code.Reference(p.ClrType())} {p.Name}");
+
+            var identifier = GenerateIdentifierName(function, model);
+
+            Sb.AppendLine();
+
+            Sb.AppendLine($"[DbFunction(\"{function.Name}\", \"{function.Schema}\")]");
+
+            if ((function as Function)!.IsScalar)
+            {
+                var returnType = paramStrings.First();
+                var parameters = string.Empty;
+
+                if (function.Parameters.Count > 1)
+                {
+                    parameters = string.Join(", ", paramStrings.Skip(1));
+                }
+
+                Sb.AppendLine($"public static {returnType}{identifier}({parameters})");
+
+                Sb.AppendLine("{");
+                using (Sb.Indent())
+                {
+                    Sb.AppendLine("throw new NotSupportedException(\"This method can only be called from Entity Framework Core queries\");");
+                }
+
+                Sb.AppendLine("}");
+            }
+            else
+            {
+                var typeName = $"{identifier}Result";
+                var returnType = $"IQueryable<{typeName}>";
+
+                var parameters = string.Empty;
+
+                if (function.Parameters.Any())
+                {
+                    parameters = string.Join(", ", paramStrings);
+                }
+
+                Sb.AppendLine($"public {returnType} {identifier}({parameters})");
+
+                Sb.AppendLine("{");
+                using (Sb.Indent())
+                {
+                    var argumentStrings = function.Parameters
+                        .Select(p => p.Name);
+                    var arguments = string.Join(", ", argumentStrings);
+                    Sb.AppendLine($"return FromExpression(() => {identifier}({arguments}));");
+                }
+
+                Sb.AppendLine("}");
+            }
+        }
+    }
+}
